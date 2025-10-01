@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Shell Runner UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: linear-gradient(135deg, #1c2846, #5a3d8c, #2386b8);
+      --panel-bg: rgba(255, 255, 255, 0.12);
+      --panel-border: rgba(255, 255, 255, 0.35);
+      --text: #f6f7fb;
+      --log-bg: rgba(16, 22, 38, 0.88);
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    .app {
+      width: min(920px, 100%);
+      background: rgba(4, 8, 20, 0.35);
+      border-radius: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      padding: 36px;
+      box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(14px);
+    }
+
+    h1 {
+      margin-top: 0;
+      text-align: center;
+      font-size: 2.2rem;
+    }
+
+    p.subtitle {
+      text-align: center;
+      margin-bottom: 32px;
+      opacity: 0.8;
+    }
+
+    .panel {
+      background: var(--panel-bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 18px;
+      padding: 24px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .panels {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    select,
+    input[type="text"],
+    button {
+      width: 100%;
+      border-radius: 10px;
+      border: none;
+      padding: 10px 12px;
+      font-size: 1rem;
+      font-family: inherit;
+    }
+
+    select,
+    input[type="text"] {
+      background: rgba(255, 255, 255, 0.92);
+      color: #1b2440;
+    }
+
+    button {
+      background: linear-gradient(135deg, #2f80ed, #56ccf2);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s ease, box-shadow 0.2s ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 18px rgba(47, 128, 237, 0.35);
+    }
+
+    button:disabled {
+      background: rgba(129, 140, 248, 0.5);
+      cursor: progress;
+      box-shadow: none;
+      transform: none;
+    }
+
+    pre.log {
+      background: var(--log-bg);
+      border-radius: 12px;
+      padding: 14px 16px;
+      font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+      font-size: 0.95rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 120px;
+      max-height: 240px;
+    }
+
+    .status {
+      font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+      font-size: 0.9rem;
+      opacity: 0.8;
+    }
+
+    .error {
+      color: #ffb4b4;
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <h1>Shell Scripts, Now on the Web</h1>
+    <p class="subtitle">Pick a script, provide its argument, and see the output without opening Terminal.</p>
+
+    <section class="panels">
+      <article class="panel" id="runner">
+        <div>
+          <label for="script-select">Script</label>
+          <select id="script-select" autofocus></select>
+        </div>
+
+        <div>
+          <label for="argument-input">Argument</label>
+          <input id="argument-input" type="text" placeholder="Type the argument…" />
+        </div>
+
+        <button id="run-button">Run Script</button>
+        <div class="status" id="status">Waiting to run.</div>
+        <pre class="log" id="log">(no output yet)</pre>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const scriptSelect = document.getElementById('script-select');
+    const argumentInput = document.getElementById('argument-input');
+    const runButton = document.getElementById('run-button');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+
+    async function fetchScripts() {
+      try {
+        const response = await fetch('/api/scripts');
+        if (!response.ok) throw new Error('Unable to fetch scripts');
+        const payload = await response.json();
+        scriptSelect.innerHTML = '';
+        payload.scripts.forEach((name) => {
+          const option = document.createElement('option');
+          option.value = name;
+          option.textContent = name;
+          scriptSelect.appendChild(option);
+        });
+        if (payload.scripts.length === 0) {
+          runButton.disabled = true;
+          statusEl.textContent = 'No scripts found in the scripts/ directory.';
+        }
+      } catch (error) {
+        runButton.disabled = true;
+        statusEl.textContent = 'Failed to load script list. Check the server logs.';
+        console.error(error);
+      }
+    }
+
+    async function runScript() {
+      const script = scriptSelect.value;
+      const argument = argumentInput.value;
+      if (!script) return;
+
+      runButton.disabled = true;
+      statusEl.textContent = 'Running…';
+      logEl.textContent = '(collecting output…)';
+
+      try {
+        const response = await fetch('/api/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ script, argument })
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || 'Request failed');
+        }
+
+        const result = await response.json();
+        const lines = [];
+        if (result.stdout) {
+          lines.push(result.stdout.trim());
+        }
+        if (result.stderr) {
+          lines.push('\n[stderr]\n' + result.stderr.trim());
+        }
+        logEl.textContent = lines.length ? lines.join('\n') : '(no output)';
+        statusEl.textContent = `Finished with status ${result.exit_code}.`;
+      } catch (error) {
+        console.error(error);
+        logEl.textContent = error.message || 'Unexpected error';
+        statusEl.textContent = 'Run failed.';
+        statusEl.classList.add('error');
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    runButton.addEventListener('click', runScript);
+    argumentInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        runScript();
+      }
+    });
+
+    fetchScripts();
+  </script>
+</body>
+</html>
