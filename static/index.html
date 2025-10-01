@@ -59,6 +59,12 @@
       gap: 16px;
     }
 
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
     .panels {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -101,11 +107,26 @@
       box-shadow: 0 10px 18px rgba(47, 128, 237, 0.35);
     }
 
+    button.secondary {
+      background: rgba(255, 255, 255, 0.18);
+      color: var(--text);
+      box-shadow: none;
+    }
+
+    button.secondary:hover {
+      box-shadow: 0 10px 18px rgba(255, 255, 255, 0.18);
+    }
+
     button:disabled {
       background: rgba(129, 140, 248, 0.5);
       cursor: progress;
       box-shadow: none;
       transform: none;
+    }
+
+    button.secondary:disabled {
+      background: rgba(255, 255, 255, 0.12);
+      cursor: not-allowed;
     }
 
     pre.log {
@@ -134,7 +155,7 @@
 </head>
 <body>
   <main class="app">
-    <h1>Shell Scripts, Now on the Web</h1>
+    <h1>Scripts, Now on the Web</h1>
     <p class="subtitle">Pick a script, provide its argument, and see the output without opening Terminal.</p>
 
     <section class="panels">
@@ -149,7 +170,10 @@
           <input id="argument-input" type="text" placeholder="Type the argument…" />
         </div>
 
-        <button id="run-button">Run Script</button>
+        <div class="button-row">
+          <button id="run-button">Run Script</button>
+          <button id="download-button" class="secondary" disabled>Download Output</button>
+        </div>
         <div class="status" id="status">Waiting to run.</div>
         <pre class="log" id="log">(no output yet)</pre>
       </article>
@@ -160,8 +184,10 @@
     const scriptSelect = document.getElementById('script-select');
     const argumentInput = document.getElementById('argument-input');
     const runButton = document.getElementById('run-button');
+    const downloadButton = document.getElementById('download-button');
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    let currentDownloadId = null;
 
     async function fetchScripts() {
       try {
@@ -169,14 +195,18 @@
         if (!response.ok) throw new Error('Unable to fetch scripts');
         const payload = await response.json();
         scriptSelect.innerHTML = '';
-        payload.scripts.forEach((name) => {
+        currentDownloadId = null;
+        downloadButton.disabled = true;
+        payload.scripts.forEach((entry) => {
+          const { name, type } = entry;
           const option = document.createElement('option');
           option.value = name;
-          option.textContent = name;
+          option.textContent = type ? `${name} · ${type}` : name;
           scriptSelect.appendChild(option);
         });
         if (payload.scripts.length === 0) {
           runButton.disabled = true;
+          downloadButton.disabled = true;
           statusEl.textContent = 'No scripts found in the scripts/ directory.';
         }
       } catch (error) {
@@ -192,6 +222,10 @@
       if (!script) return;
 
       runButton.disabled = true;
+      downloadButton.disabled = true;
+      downloadButton.textContent = 'Download Output';
+      currentDownloadId = null;
+      statusEl.classList.remove('error');
       statusEl.textContent = 'Running…';
       logEl.textContent = '(collecting output…)';
 
@@ -208,15 +242,13 @@
         }
 
         const result = await response.json();
-        const lines = [];
-        if (result.stdout) {
-          lines.push(result.stdout.trim());
-        }
-        if (result.stderr) {
-          lines.push('\n[stderr]\n' + result.stderr.trim());
-        }
-        logEl.textContent = lines.length ? lines.join('\n') : '(no output)';
+        const display = result.combined_output || '(no output)';
+        logEl.textContent = display;
         statusEl.textContent = `Finished with status ${result.exit_code}.`;
+        if (result.download_id) {
+          currentDownloadId = result.download_id;
+          downloadButton.disabled = false;
+        }
       } catch (error) {
         console.error(error);
         logEl.textContent = error.message || 'Unexpected error';
@@ -228,6 +260,16 @@
     }
 
     runButton.addEventListener('click', runScript);
+    downloadButton.addEventListener('click', () => {
+      if (!currentDownloadId) return;
+      const url = `/api/output/${encodeURIComponent(currentDownloadId)}`;
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = '';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    });
     argumentInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();

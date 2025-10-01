@@ -6,21 +6,51 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import uuid
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from threading import Lock
 
 ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT / "scripts"
 STATIC_DIR = ROOT / "static"
 
+SUPPORTED_SCRIPT_TYPES = {
+    ".sh": {
+        "label": "Shell Script",
+        "runner": ["/bin/bash"],
+    },
+    ".py": {
+        "label": "Python Script",
+        "runner": ["python3"],
+    },
+}
 
-def list_scripts() -> list[str]:
-    return sorted(script.name for script in SCRIPTS_DIR.glob("*.sh"))
+RESULT_HISTORY_LIMIT = 50
+_RESULTS: "OrderedDict[str, dict[str, str]]" = OrderedDict()
+_RESULT_LOCK = Lock()
 
 
-def run_script(name: str, arg: str) -> dict[str, object]:
+def list_scripts() -> list[dict[str, str]]:
+    scripts: list[dict[str, str]] = []
+    for entry in SCRIPTS_DIR.iterdir():
+        if not entry.is_file():
+            continue
+        metadata = SUPPORTED_SCRIPT_TYPES.get(entry.suffix.lower())
+        if metadata is None:
+            continue
+        scripts.append({
+            "name": entry.name,
+            "type": metadata["label"],
+        })
+    scripts.sort(key=lambda item: item["name"].lower())
+    return scripts
+
+
+def _resolve_script(name: str) -> tuple[Path, list[str], str]:
     script_path = (SCRIPTS_DIR / name).resolve()
     try:
         script_path.relative_to(SCRIPTS_DIR.resolve())
@@ -30,16 +60,62 @@ def run_script(name: str, arg: str) -> dict[str, object]:
     if not script_path.exists() or not script_path.is_file():
         raise FileNotFoundError(f"script '{name}' not found")
 
+    metadata = SUPPORTED_SCRIPT_TYPES.get(script_path.suffix.lower())
+    if metadata is None:
+        raise ValueError("unsupported script type")
+
+    return script_path, list(metadata["runner"]), metadata["label"]
+
+
+def _store_result(script_name: str, stdout: str, stderr: str) -> tuple[str, str]:
+    parts: list[str] = []
+    stdout = stdout or ""
+    stderr = stderr or ""
+    if stdout:
+        parts.append(stdout.rstrip("\n"))
+    if stderr:
+        if parts:
+            parts.append("")
+        parts.append("[stderr]")
+        parts.append(stderr.rstrip("\n"))
+    combined = "\n".join(parts) if parts else "(no output)"
+    result_id = uuid.uuid4().hex
+    with _RESULT_LOCK:
+        _RESULTS[result_id] = {"script": script_name, "content": combined}
+        while len(_RESULTS) > RESULT_HISTORY_LIMIT:
+            _RESULTS.popitem(last=False)
+    return result_id, combined
+
+
+def _get_result(result_id: str) -> dict[str, str] | None:
+    with _RESULT_LOCK:
+        record = _RESULTS.get(result_id)
+        if record is None:
+            return None
+        return dict(record)
+
+
+def run_script(name: str, arg: str) -> dict[str, object]:
+    script_path, runner, script_type = _resolve_script(name)
+
+    command = runner + [str(script_path)]
+    command.append(arg)
+
     proc = subprocess.run(
-        ["/bin/bash", str(script_path), arg],
+        command,
         capture_output=True,
         text=True,
         check=False,
     )
+    download_id, combined_output = _store_result(name, proc.stdout, proc.stderr)
     return {
         "exit_code": proc.returncode,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
+        "download_id": download_id,
+        "script": name,
+        "script_type": script_type,
+        "combined_output": combined_output,
     }
 
 
@@ -53,6 +129,9 @@ class ScriptRunnerHandler(BaseHTTPRequestHandler):
             self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         elif path == "/api/scripts":
             self._write_json({"scripts": list_scripts()})
+        elif path.startswith("/api/output/"):
+            result_id = path[len("/api/output/") :]
+            self._serve_result_download(result_id)
         elif path.startswith("/static/"):
             rel = path[len("/static/") :]
             target = (STATIC_DIR / rel).resolve()
@@ -85,7 +164,7 @@ class ScriptRunnerHandler(BaseHTTPRequestHandler):
         script_name = body.get("script")
         argument = body.get("argument", "")
 
-        if not isinstance(script_name, str) or script_name not in list_scripts():
+        if not isinstance(script_name, str):
             self.send_error(HTTPStatus.BAD_REQUEST, "Unknown script")
             return
         if not isinstance(argument, str):
@@ -98,7 +177,7 @@ class ScriptRunnerHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_REQUEST, "Script not found")
             return
         except ValueError:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid script name")
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid script")
             return
         except subprocess.SubprocessError as exc:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
@@ -126,6 +205,26 @@ class ScriptRunnerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_result_download(self, result_id: str) -> None:
+        if not result_id:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Missing result id")
+            return
+
+        record = _get_result(result_id)
+        if record is None:
+            self.send_error(HTTPStatus.NOT_FOUND, "Result not found")
+            return
+
+        data = record["content"].encode("utf-8")
+        filename = self._safe_filename(record["script"], result_id)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(data)
+
     @staticmethod
     def _guess_content_type(path: Path) -> str:
         mapping = {
@@ -135,6 +234,12 @@ class ScriptRunnerHandler(BaseHTTPRequestHandler):
             ".json": "application/json; charset=utf-8",
         }
         return mapping.get(path.suffix, "application/octet-stream")
+
+    @staticmethod
+    def _safe_filename(script_name: str, result_id: str) -> str:
+        base = Path(script_name).stem or "output"
+        safe_base = "".join(ch for ch in base if ch.isalnum() or ch in {"-", "_"}) or "output"
+        return f"{safe_base}-{result_id}.log"
 
     def _write_json(self, payload: dict[str, object]) -> None:
         data = json.dumps(payload).encode("utf-8")
